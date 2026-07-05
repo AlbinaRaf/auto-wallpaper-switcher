@@ -1,0 +1,8 @@
+{
+  "single": "images\\merged.png",
+  "dual": {
+    "left": "images\\blue.png",
+    "right": "images\\pink.png"
+  },
+  "checkEverySeconds": 5
+}
