@@ -8,16 +8,13 @@ $base = Split-Path -Parent $MyInvocation.MyCommand.Path
 $configPath = Join-Path $base 'wallpapers.json'
 $startup = [Environment]::GetFolderPath('Startup')
 $shortcutPath = Join-Path $startup 'Auto Wallpaper.lnk'
+$taskName = 'Auto Wallpaper'
 $programs = [Environment]::GetFolderPath('Programs')
 $hotkeyDir = Join-Path $programs 'Auto Wallpaper Hotkeys'
 
 if ($Action -eq 'install') {
     $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = (Get-Command powershell.exe).Source
-    $shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`" -Action run"
-    $shortcut.WorkingDirectory = $base
-    $shortcut.Save()
+    Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
 
     New-Item -ItemType Directory -Path $hotkeyDir -Force | Out-Null
     $displaySwitch = Join-Path $env:WINDIR 'System32\DisplaySwitch.exe'
@@ -37,17 +34,29 @@ if ($Action -eq 'install') {
     Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*AutoWallpaper.ps1*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Process -FilePath (Get-Command powershell.exe).Source `
-        -ArgumentList "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`" -Action run" `
-        -WindowStyle Hidden
-    Write-Host "Startup enabled: $shortcutPath"
+
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    $powershell = (Get-Command powershell.exe).Source
+    $arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`" -Action run"
+    $taskAction = New-ScheduledTaskAction -Execute $powershell -Argument $arguments -WorkingDirectory $base
+    $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    $taskTrigger.Delay = 'PT20S'
+    $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew
+    $taskPrincipal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $taskName -Action $taskAction -Trigger $taskTrigger -Settings $taskSettings -Principal $taskPrincipal -Description 'Automatic wallpaper switcher for one or two active monitors.' -Force | Out-Null
+    Start-ScheduledTask -TaskName $taskName
+    Write-Host "Scheduled task enabled: $taskName"
     exit
 }
 
 if ($Action -eq 'uninstall') {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $hotkeyDir -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host 'Startup disabled.'
+    Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*AutoWallpaper.ps1*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Write-Host 'Autostart disabled.'
     exit
 }
 
@@ -100,14 +109,39 @@ public static class WallpaperApi {
     private const uint SPIF_UPDATEINIFILE = 0x0001;
     private const uint SPIF_SENDCHANGE = 0x0002;
 
-    private static int GetActiveMonitorCount() {
-        int count = 0;
+    private static List<RECT> GetActiveMonitorRects() {
+        var rects = new List<RECT>();
         MonitorEnumProc callback = delegate(IntPtr monitor, IntPtr dc, IntPtr rect, IntPtr data) {
-            count++;
+            rects.Add((RECT)Marshal.PtrToStructure(rect, typeof(RECT)));
             return true;
         };
         EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, callback, IntPtr.Zero);
-        return count;
+        return rects;
+    }
+
+    private static int GetActiveMonitorCount() {
+        return GetActiveMonitorRects().Count;
+    }
+
+    public static string GetActiveState() {
+        var rects = GetActiveMonitorRects();
+        if (rects.Count <= 1)
+            return "1|global";
+
+        rects.Sort((a, b) => {
+            int byLeft = a.Left.CompareTo(b.Left);
+            if (byLeft != 0) return byLeft;
+            return a.Top.CompareTo(b.Top);
+        });
+
+        var signature = new System.Text.StringBuilder(rects.Count.ToString());
+        foreach (var rect in rects)
+            signature.Append("|")
+                .Append(rect.Left).Append(",")
+                .Append(rect.Top).Append(",")
+                .Append(rect.Right).Append(",")
+                .Append(rect.Bottom);
+        return signature.ToString();
     }
 
     private static IDesktopWallpaper Create() {
@@ -116,16 +150,16 @@ public static class WallpaperApi {
     }
 
     public static string Apply(string single, string left, string right) {
+        int activeCount = GetActiveMonitorCount();
+        if (activeCount <= 1) {
+            if (!SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, single,
+                SPIF_UPDATEINIFILE | SPIF_SENDCHANGE))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            return "1|global";
+        }
+
         IDesktopWallpaper desktop = Create();
         try {
-            int activeCount = GetActiveMonitorCount();
-            if (activeCount <= 1) {
-                if (!SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, single,
-                    SPIF_UPDATEINIFILE | SPIF_SENDCHANGE))
-                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-                return "1|global";
-            }
-
             uint count = desktop.GetMonitorDevicePathCount();
             var monitors = new List<MonitorInfo>();
             for (uint i = 0; i < count; i++) {
@@ -173,20 +207,23 @@ $rightImage = Resolve-Image $config.dual.right
 $lastSignature = ''
 
 function Set-ForCurrentMonitors {
-    $signature = [WallpaperApi]::Apply($single, $leftImage, $rightImage)
-    $script:lastSignature = $signature
-    return $signature
+    $signature = [WallpaperApi]::GetActiveState()
+    if ($signature -ne $script:lastSignature) {
+        [WallpaperApi]::Apply($single, $leftImage, $rightImage) | Out-Null
+        $script:lastSignature = $signature
+        return "$signature applied"
+    }
+    return "$signature unchanged"
 }
 
-$initialSignature = Set-ForCurrentMonitors
-if ($Action -eq 'diagnose') {
-    Write-Host "$(Get-Date -Format T) active state: $initialSignature"
+if ($Action -eq 'once') {
+    Set-ForCurrentMonitors | Out-Null
+    exit
 }
-if ($Action -eq 'once') { exit }
 
-# Polling reliably detects docking, sleep and RDP display changes.
+# Keep retrying because Explorer and the desktop COM service may not be ready
+# yet when Windows starts this script from the Startup folder.
 while ($true) {
-    Start-Sleep -Seconds ([Math]::Max(2, [int]$config.checkEverySeconds))
     try {
         $currentSignature = Set-ForCurrentMonitors
         if ($Action -eq 'diagnose') {
@@ -199,4 +236,6 @@ while ($true) {
             Write-Host "$(Get-Date -Format T) ERROR: $($_.Exception.Message)" -ForegroundColor Red
         }
     }
+
+    Start-Sleep -Seconds ([Math]::Max(2, [int]$config.checkEverySeconds))
 }
